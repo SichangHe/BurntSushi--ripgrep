@@ -703,7 +703,9 @@ fn home_dir() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::{fs, path::Path, process::Command};
+
+    use crate::tests::TempDir;
 
     use super::{Gitignore, GitignoreBuilder};
 
@@ -874,6 +876,271 @@ mod tests {
         assert!(gi.matched("foo.HTML", false).is_ignore());
         assert!(!gi.matched("foo.htm", false).is_ignore());
         assert!(!gi.matched("foo.HTM", false).is_ignore());
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum MatchKind {
+        Ignore,
+        Whitelist,
+        None,
+    }
+
+    struct GitCheckCase<'a> {
+        name: &'a str,
+        gitignore: &'a str,
+        create_path: &'a str,
+        query_path: &'a str,
+        is_dir: bool,
+        kind: MatchKind,
+    }
+
+    struct GitSandbox {
+        home: std::path::PathBuf,
+        xdg: std::path::PathBuf,
+        global: std::path::PathBuf,
+        system: std::path::PathBuf,
+        excludes: std::path::PathBuf,
+        template: std::path::PathBuf,
+    }
+
+    fn create_git_path(root: &Path, path: &str, is_dir: bool) {
+        let full = root.join(path);
+        if is_dir {
+            fs::create_dir_all(&full).unwrap();
+        } else {
+            if let Some(parent) = full.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(&full, b"bounded ignore test").unwrap();
+        }
+    }
+
+    fn create_git_sandbox(root: &Path) -> GitSandbox {
+        let sandbox = root.join("git-sandbox");
+        let home = sandbox.join("home");
+        let xdg = sandbox.join("xdg");
+        let global = sandbox.join("global.gitconfig");
+        let system = sandbox.join("system.gitconfig");
+        let excludes = sandbox.join("empty-excludes");
+        let template = sandbox.join("template");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&xdg).unwrap();
+        fs::create_dir_all(&template).unwrap();
+        fs::write(&global, b"").unwrap();
+        fs::write(&system, b"").unwrap();
+        fs::write(&excludes, b"").unwrap();
+        GitSandbox { home, xdg, global, system, excludes, template }
+    }
+
+    fn git(root: &Path, sandbox: &GitSandbox) -> Command {
+        let mut cmd = Command::new("git");
+        cmd.current_dir(root)
+            .env("HOME", &sandbox.home)
+            .env("XDG_CONFIG_HOME", &sandbox.xdg)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", &sandbox.global)
+            .env("GIT_CONFIG_SYSTEM", &sandbox.system)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE");
+        cmd
+    }
+
+    fn git_init(root: &Path, sandbox: &GitSandbox) {
+        let status = git(root, sandbox)
+            .arg("-c")
+            .arg(format!("core.excludesFile={}", sandbox.excludes.display()))
+            .arg("init")
+            .arg("-q")
+            .arg("--template")
+            .arg(&sandbox.template)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git init failed: {status:?}");
+        let info = root.join(".git").join("info");
+        fs::create_dir_all(&info).unwrap();
+        fs::write(info.join("exclude"), b"").unwrap();
+    }
+
+    fn git_check_ignore(
+        root: &Path,
+        sandbox: &GitSandbox,
+        path: &str,
+    ) -> bool {
+        let status = git(root, sandbox)
+            .arg("-c")
+            .arg(format!("core.excludesFile={}", sandbox.excludes.display()))
+            .arg("check-ignore")
+            .arg("-q")
+            .arg("--")
+            .arg(path)
+            .status()
+            .unwrap();
+        match status.code() {
+            Some(0) => true,
+            Some(1) => false,
+            _ => panic!("git check-ignore failed for {path:?}: {status:?}"),
+        }
+    }
+
+    #[test]
+    #[ignore = "requires git CLI and an explicitly isolated Git oracle"]
+    fn matched_agrees_with_git_check_ignore_for_bounded_cases() {
+        let cases = [
+            GitCheckCase {
+                name: "anchored root file",
+                gitignore: "/foo\n",
+                create_path: "foo",
+                query_path: "foo",
+                is_dir: false,
+                kind: MatchKind::Ignore,
+            },
+            GitCheckCase {
+                name: "anchored does not match nested file",
+                gitignore: "/foo\n",
+                create_path: "src/foo",
+                query_path: "src/foo",
+                is_dir: false,
+                kind: MatchKind::None,
+            },
+            GitCheckCase {
+                name: "unanchored matches nested file",
+                gitignore: "foo\n",
+                create_path: "src/foo",
+                query_path: "src/foo",
+                is_dir: false,
+                kind: MatchKind::Ignore,
+            },
+            GitCheckCase {
+                name: "directory rule matches directory",
+                gitignore: "foo/\n",
+                create_path: "foo",
+                query_path: "foo",
+                is_dir: true,
+                kind: MatchKind::Ignore,
+            },
+            GitCheckCase {
+                name: "directory rule skips file",
+                gitignore: "foo/\n",
+                create_path: "foo",
+                query_path: "foo",
+                is_dir: false,
+                kind: MatchKind::None,
+            },
+            GitCheckCase {
+                name: "negation whitelists last match",
+                gitignore: "foo\n!foo\n",
+                create_path: "foo",
+                query_path: "foo",
+                is_dir: false,
+                kind: MatchKind::Whitelist,
+            },
+            GitCheckCase {
+                name: "last match ignore overrides whitelist",
+                gitignore: "!src/main.rs\n*.rs\n",
+                create_path: "src/main.rs",
+                query_path: "src/main.rs",
+                is_dir: false,
+                kind: MatchKind::Ignore,
+            },
+            GitCheckCase {
+                name: "directory whitelist does not unignore file",
+                gitignore: "foo\n!foo/\n",
+                create_path: "foo",
+                query_path: "foo",
+                is_dir: false,
+                kind: MatchKind::Ignore,
+            },
+            GitCheckCase {
+                name: "directory whitelist unignores directory",
+                gitignore: "foo/\n!foo/\n",
+                create_path: "foo",
+                query_path: "foo",
+                is_dir: true,
+                kind: MatchKind::Whitelist,
+            },
+            GitCheckCase {
+                name: "doublestar matches nested basename",
+                gitignore: "**/foo\n",
+                create_path: "a/b/foo",
+                query_path: "a/b/foo",
+                is_dir: false,
+                kind: MatchKind::Ignore,
+            },
+            GitCheckCase {
+                name: "doublestar contents skip directory itself",
+                gitignore: "foo/**\n",
+                create_path: "foo",
+                query_path: "foo",
+                is_dir: true,
+                kind: MatchKind::None,
+            },
+            GitCheckCase {
+                name: "doublestar contents match descendant",
+                gitignore: "foo/**\n",
+                create_path: "foo/bar",
+                query_path: "foo/bar",
+                is_dir: false,
+                kind: MatchKind::Ignore,
+            },
+            GitCheckCase {
+                name: "leading dot slash path normalization",
+                gitignore: "foo\n",
+                create_path: "foo",
+                query_path: "./foo",
+                is_dir: false,
+                kind: MatchKind::Ignore,
+            },
+        ];
+
+        let git_version =
+            Command::new("git").arg("--version").output().unwrap();
+        assert!(
+            git_version.status.success(),
+            "git --version failed: {:?}",
+            git_version.status
+        );
+        eprintln!(
+            "git oracle version: {}",
+            String::from_utf8(git_version.stdout).unwrap().trim()
+        );
+
+        for case in cases {
+            let root = TempDir::new().unwrap();
+            let sandbox = create_git_sandbox(root.path());
+            fs::write(root.path().join(".gitignore"), case.gitignore).unwrap();
+            create_git_path(root.path(), case.create_path, case.is_dir);
+            eprintln!(
+                "git oracle isolation: case={}; HOME={}; XDG_CONFIG_HOME={}; GIT_CONFIG_NOSYSTEM=1; excludes={}; template={}",
+                case.name,
+                sandbox.home.display(),
+                sandbox.xdg.display(),
+                sandbox.excludes.display(),
+                sandbox.template.display()
+            );
+            git_init(root.path(), &sandbox);
+
+            let (gi, err) = Gitignore::new(root.path().join(".gitignore"));
+            assert!(err.is_none(), "unexpected parse error in {}", case.name);
+
+            let actual =
+                gi.matched(root.path().join(case.query_path), case.is_dir);
+            match case.kind {
+                MatchKind::Ignore => {
+                    assert!(actual.is_ignore(), "{}", case.name)
+                }
+                MatchKind::Whitelist => {
+                    assert!(actual.is_whitelist(), "{}", case.name)
+                }
+                MatchKind::None => assert!(actual.is_none(), "{}", case.name),
+            }
+            assert_eq!(
+                actual.is_ignore(),
+                git_check_ignore(root.path(), &sandbox, case.query_path),
+                "{}",
+                case.name
+            );
+        }
     }
 
     ignored!(cs1, ROOT, "*.html", "foo.html");
